@@ -1,0 +1,645 @@
+"""Terminal rendering: an aligned queue-depth table with colour that degrades cleanly.
+
+Layout strategy: group rows by model family with a subtotal per family, build the widest
+column set the terminal can hold (dropping optional columns), then middle-elide names to
+absorb whatever is left over.
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import sys
+from collections.abc import Sequence
+from dataclasses import dataclass
+
+from .model import (
+    DEFAULT_THRESHOLDS,
+    AliasUsage,
+    Level,
+    ModelUsage,
+    Snapshot,
+    TeamOverview,
+    Thresholds,
+    group_by_family,
+    summarise,
+)
+
+CODES = {
+    "bold": "1",
+    "dim": "2",
+    "red": "31",
+    "green": "32",
+    "yellow": "33",
+    "blue": "34",
+    "cyan": "36",
+    "grey": "90",
+}
+LEVEL_STYLE: dict[Level, str] = {
+    Level.IDLE: "grey",
+    Level.OK: "green",
+    Level.WARN: "yellow",
+    Level.CRIT: "red",
+}
+GAP = "   "
+#: indent for models listed under a family subtotal
+GROUP_GAP = "  "
+
+
+def clamp(text: str, width: int, theme: Theme) -> str:
+    """Force a prose line onto one terminal row, keeping its tail if it must shrink."""
+    if width <= 0 or len(text) <= width:
+        return text
+    return elide(text, width, theme)
+
+
+def strip_ansi(text: str) -> str:
+    """Visible characters only, for width maths."""
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        if text[i] == "\x1b":
+            end = text.find("m", i)
+            if end == -1:
+                break
+            i = end + 1
+            continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+def supports_color(stream=None) -> bool:
+    stream = stream or sys.stdout
+    if os.environ.get("NO_COLOR") or os.environ.get("TERM") == "dumb":
+        return False
+    if os.environ.get("FORCE_COLOR"):
+        return True
+    return bool(getattr(stream, "isatty", lambda: False)())
+
+
+def unicode_ok(stream=None) -> bool:
+    encoding = (getattr(stream or sys.stdout, "encoding", None) or "").lower()
+    return "utf" in encoding
+
+
+@dataclass
+class Theme:
+    """ANSI styling that turns itself off when it would be noise."""
+
+    color: bool = True
+    unicode: bool = True
+
+    @classmethod
+    def detect(cls, stream=None, *, force_color: bool = False, no_color: bool = False) -> Theme:
+        color = supports_color(stream) or bool(force_color)
+        if no_color:
+            color = False
+        return cls(color=color, unicode=unicode_ok(stream))
+
+    @classmethod
+    def plain(cls) -> Theme:
+        return cls(color=False, unicode=True)
+
+    def paint(self, text: str, *styles: str | None) -> str:
+        chosen = [s for s in styles if s]
+        if not self.color or not chosen:
+            return text
+        return "".join(f"\x1b[{CODES[s]}m" for s in chosen) + text + "\x1b[0m"
+
+    def gauge(self, ratio: float, cells: int = 8) -> str:
+        ratio = max(0.0, min(1.0, ratio))
+        filled = round(ratio * cells)
+        mark = "█" if self.unicode else "#"
+        empty = "·" if self.unicode else "."
+        return mark * filled + empty * (cells - filled)
+
+
+@dataclass
+class RenderOptions:
+    thresholds: Thresholds = DEFAULT_THRESHOLDS
+    show_gateway: bool = False
+    show_reason: bool = False
+    full_names: bool = False
+    group: bool = True
+    show_org: bool = False
+    show_contention: bool = True
+    sort_key: str = "load"
+    window: str = "15m"
+    max_keys: int = 8
+    width: int = 0
+
+    def resolved_width(self) -> int:
+        if self.width:
+            return max(60, int(self.width))
+        return max(72, min(shutil.get_terminal_size((110, 24)).columns, 220))
+
+
+@dataclass
+class RowSpec:
+    """One table line: a model row, or a family subtotal backed by an aggregate row.
+
+    ``ends_group`` marks the last line of a family block, which is where a blank line goes.
+    """
+
+    model: ModelUsage
+    label: str
+    indent: str = ""
+    bold: bool = False
+    is_group: bool = False
+    ends_group: bool = False
+    starts_group: bool = False
+
+    @property
+    def display(self) -> str:
+        return self.indent + self.label
+
+
+def display_label(model: ModelUsage, opts: RenderOptions) -> str:
+    """Name shown in the MODEL column: the checkpoint without its org by default."""
+    return model.name if opts.show_org else model.short_name
+
+
+def plan_rows(models: Sequence[ModelUsage], opts: RenderOptions) -> list[RowSpec]:
+    """Turn the selected models into table lines, grouped by family with a subtotal each.
+
+    Families are emitted in a fixed alphabetical block order so the layout does not move while
+    traffic changes; ``sort_key`` only orders the models inside each block. A family with one
+    model gets no subtotal line, since a header identical to its only row is just noise.
+    """
+    if not opts.group:
+        return [RowSpec(model, display_label(model, opts)) for model in models]
+
+    rows: list[RowSpec] = []
+    for group in group_by_family(models, opts.sort_key):
+        if len(group.members) == 1:
+            member = group.members[0]
+            rows.append(RowSpec(member, display_label(member, opts), starts_group=True, ends_group=True))
+            continue
+        summary = group.summary()
+        label = f"{group.label} ({len(group.members)} models)"
+        rows.append(RowSpec(summary, label, bold=True, is_group=True, starts_group=True))
+        rows.extend(
+            RowSpec(
+                member,
+                display_label(member, opts),
+                indent=GROUP_GAP,
+                ends_group=index == len(group.members) - 1,
+            )
+            for index, member in enumerate(group.members)
+        )
+    return rows
+
+
+TOTALS_MARK = "rule"
+
+
+def interleave_rows(
+    table: Sequence[str],
+    marks: Sequence[str],
+    *,
+    header_rows: int,
+    rule: str = "",
+) -> list[str]:
+    """Decorate formatted rows: "" keeps the row, "blank" and "rule" insert a line before it."""
+    lines = list(table[:header_rows])
+    for index, line in enumerate(table[header_rows:]):
+        mark = marks[index] if index < len(marks) else ""
+        if mark == "rule" and rule:
+            lines.append(rule)
+        elif mark == "blank":
+            lines.append("")
+        lines.append(line)
+    return lines
+
+
+def format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "-"
+    if seconds <= 0:
+        return "0ms"
+    if seconds < 0.001:
+        return "<1ms"
+    if seconds < 1:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 120:
+        return f"{seconds:.2f}s"
+    minutes, secs = divmod(round(seconds), 60)
+    return f"{minutes}m{secs:02d}s"
+
+
+def duration_style(seconds: float | None) -> str | None:
+    if seconds is None:
+        return None
+    if seconds >= 30:
+        return "red"
+    if seconds >= 3:
+        return "yellow"
+    return None
+
+
+def visible_len(text: str) -> int:
+    return len(strip_ansi(text))
+
+
+def pad(text: str, size: int, align: str) -> str:
+    """Pad to a *visible* width: str.ljust() would count ANSI bytes as content."""
+    fill = max(0, size - visible_len(text))
+    return text + " " * fill if align == "left" else " " * fill + text
+
+
+def elide(text: str, width: int, theme: Theme) -> str:
+    """Middle-elide so both the org prefix and the version suffix stay visible."""
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    mark = "…" if theme.unicode else "~"
+    if width <= len(mark):
+        return mark[:width]
+    keep = width - len(mark)
+    head = keep // 2
+    tail = keep - head
+    return text[:head] + mark + (text[len(text) - tail :] if tail else "")
+
+
+@dataclass
+class Column:
+    key: str
+    header: str
+    align: str = "right"  # left|right
+    optional: bool = False  # droppable when the terminal is narrow
+    fixed: int | None = None  # hard width, otherwise measured from content
+
+    def width(self, cells: Sequence[str]) -> int:
+        if self.fixed is not None:
+            return self.fixed
+        return max([len(self.header)] + [len(strip_ansi(c)) for c in cells])
+
+
+KV_WIDTH = 14  # '████····  44%'
+
+
+def plan_columns(rows: Sequence[RowSpec], opts: RenderOptions, width: int) -> list[Column]:
+    columns = [
+        Column("name", "MODEL", align="left"),
+        Column("runwait", "RUN/WAIT"),
+    ]
+    if opts.show_contention:
+        # recent contention, because RUN/WAIT is a snapshot and the dashboard shows a curve
+        columns.append(Column("waitmax", "WAIT MAX", fixed=9, optional=True))
+        columns.append(Column("queued", "QUEUED", fixed=7, optional=True))
+    if opts.show_reason and any(row.model.waiting for row in rows):
+        # ask for --reason and the column appears whenever anything is queued;
+        # waiting_by_reason can lag num_requests_waiting by a scrape interval
+        columns.append(Column("reason", "cap/def", fixed=8, optional=True))
+    columns.append(Column("nodes", "NODES", fixed=6, optional=True))
+    columns.append(Column("kv", "KV CACHE", fixed=KV_WIDTH, optional=True))
+    columns.append(Column("queue", "AVG WAIT", fixed=9, optional=True))
+    columns.append(Column("status", "STATUS", align="left", fixed=12))
+
+    def estimate(col: Column) -> int:
+        # the planner runs before cells exist, so approximate what is measured later
+        return col.fixed if col.fixed is not None else len(col.header) + 1
+
+    def natural(cols: list[Column]) -> int:
+        # reserve the widest thing the name column will ever have to show
+        name_floor = max((len(row.display) for row in rows), default=10)
+        if not opts.full_names:
+            name_floor = min(name_floor, 34)
+        name_floor = max(name_floor, len("MODEL"), 12)
+        gaps = GAP * (len(cols) - 1)
+        body = sum(estimate(c) for c in cols if c.key != "name")
+        return name_floor + body + len(gaps)
+
+    while natural(columns) > width and any(c.optional for c in columns):
+        for candidate in reversed(columns):
+            if candidate.optional:
+                columns.remove(candidate)
+                break
+    return columns
+
+
+def cell_for(row: RowSpec, key: str, theme: Theme, opts: RenderOptions) -> str:
+    """One styled cell. ``row.model`` may be a real model or a family aggregate."""
+    model = row.model
+    level = model.level(opts.thresholds)
+    style = LEVEL_STYLE[level]
+    if key == "name":
+        name_style = None if level is Level.OK else style
+        return theme.paint(row.display, name_style, "bold" if row.bold else None)
+    if key == "runwait":
+        run = theme.paint(str(model.running), "bold") if model.running else theme.paint("0", "dim")
+        wait = (
+            theme.paint(str(model.waiting), style, "bold")
+            if model.waiting
+            else theme.paint("0", "dim")
+        )
+        return f"{run}{theme.paint('/', 'grey')}{wait}"
+    if key == "waitmax":
+        if row.is_group:
+            return theme.paint("-", "dim")
+        if not model.waiting_peak:
+            return theme.paint("0", "dim")
+        return theme.paint(str(model.waiting_peak), "yellow")
+    if key == "queued":
+        if row.is_group or model.queued_share is None:
+            return theme.paint("-", "dim")
+        percent = model.queued_share * 100
+        text = f"{percent:3.0f}%"
+        style = "red" if percent >= 50 else "yellow" if percent >= 20 else "green" if percent > 0 else "dim"
+        return theme.paint(text, style)
+    if key == "reason":
+        if not (model.waiting_capacity or model.waiting_deferred):
+            return theme.paint("-", "dim")
+        return f"{model.waiting_capacity}/{model.waiting_deferred}"
+    if key == "nodes":
+        text = f"{model.busy_replicas}/{model.replicas}"
+        return theme.paint(text, "cyan" if model.busy_replicas else "grey")
+    if key == "kv":
+        if model.kv_cache is None:
+            return theme.paint("n/a", "dim")
+        percent = model.kv_cache * 100
+        gauge_style = "red" if percent >= 90 else "yellow" if percent >= 75 else "green" if percent >= 20 else "grey"
+        return theme.paint(theme.gauge(model.kv_cache), gauge_style) + f" {percent:3.0f}%"
+    if key == "queue":
+        text = format_duration(model.queue_avg)
+        return theme.paint(text, duration_style(model.queue_avg)) if text != "-" else theme.paint(text, "dim")
+    if key == "status":
+        return theme.paint(model.verdict(opts.thresholds), style)
+    raise KeyError(key)  # pragma: no cover
+
+
+def format_table(
+    columns: Sequence[Column],
+    rows: Sequence[Sequence[str]],
+    *,
+    width: int,
+    theme: Theme,
+    primary: str = "name",
+    primary_floor: int = 12,
+    separator: bool = False,
+) -> list[str]:
+    """Render styled cells into aligned lines; the primary column absorbs slack."""
+    index = {col.key: i for i, col in enumerate(columns)}
+    sizes: dict[str, int] = {}
+    for col in columns:
+        if col.key == primary:
+            continue
+        cells = [row[index[col.key]] for row in rows]
+        sizes[col.key] = col.width(cells)
+
+    primary_col = next(col for col in columns if col.key == primary)
+    name_needed = max(
+        len(primary_col.header),
+        max((len(strip_ansi(row[index[primary]])) for row in rows), default=8),
+    )
+    gaps = len(GAP) * (len(columns) - 1)
+    others = sum(sizes.values())
+
+    if name_needed + others + gaps <= width:
+        sizes[primary] = name_needed
+    else:
+        # Model names elide gracefully ("Qwe…27B"); numbers and status words do not,
+        # so the name column absorbs pressure first (up to primary_floor).
+        deficit = name_needed + others + gaps - width
+        floor = min(name_needed, primary_floor)
+        cut = min(deficit, name_needed - floor)
+        sizes[primary] = name_needed - cut
+        deficit -= cut
+        for col in reversed(columns):
+            if deficit <= 0:
+                break
+            if col.key == primary:
+                continue
+            room = sizes[col.key] - 5
+            if room <= 0:
+                continue
+            take = min(room, deficit)
+            sizes[col.key] -= take
+            deficit -= take
+
+    def paint_header(col: Column) -> str:
+        text = col.header
+        size = sizes[col.key]
+        text = text if len(text) <= size else elide(text, size, theme)
+        # pad outside the escape codes so trailing spaces can be stripped
+        return pad(theme.paint(text, "bold", "grey"), size, col.align)
+
+    lines = [GAP.join(paint_header(col) for col in columns).rstrip()]
+    if separator:
+        lines.append(theme.paint("-" * len(strip_ansi(lines[0])), "dim"))
+
+    for row in rows:
+        parts = []
+        for col in columns:
+            size = sizes[col.key]
+            text = row[index[col.key]]
+            visible = strip_ansi(text)
+            if len(visible) > size:
+                text = elide(visible, size, theme) if col.key == primary else visible[:size]
+            parts.append(pad(text, size, col.align))
+        lines.append(GAP.join(parts).rstrip())
+    return lines
+
+
+def render_header(snapshot: Snapshot, models: Sequence[ModelUsage], theme: Theme, opts: RenderOptions) -> list[str]:
+    """Title + one summary line, always describing what is actually on screen."""
+    width = opts.resolved_width()
+    lines = [theme.paint(clamp("NRP model usage", width, theme), "bold", "cyan")]
+    scope = ""
+    if len(models) != len(snapshot.models):
+        scope = f"showing {len(models)} of {len(snapshot.models)} models"
+    lines.append(theme.paint(snapshot.headline(models, label=scope, width=width), "grey"))
+    if opts.show_contention:
+        # WAIT MAX / QUEUED / AVG WAIT no longer carry the window in their header, so say it once
+        lines.append(
+            theme.paint(
+                clamp(f"WAIT MAX, QUEUED and AVG WAIT cover the last {opts.window}", width, theme),
+                "dim",
+            )
+        )
+    queued = [m for m in models if m.queued]
+    if queued:
+        worst = max(queued, key=lambda m: m.waiting)
+        detail = (
+            f"busiest queue: {display_label(worst, opts)} ({worst.waiting} waiting, "
+            f"{format_duration(worst.queue_avg)} mean wait so far)"
+        )
+        lines.append(theme.paint(clamp(detail, width, theme), "yellow"))
+    return lines
+
+
+def totals_row(models: Sequence[ModelUsage], columns: Sequence[Column], theme: Theme) -> list[str]:
+    totals = summarise(models)
+    cells = []
+    for col in columns:
+        if col.key == "name":
+            cells.append(theme.paint("TOTAL", "bold"))
+        elif col.key == "runwait":
+            run = theme.paint(str(totals.running), "bold")
+            wait = theme.paint(str(totals.waiting), "bold" if totals.waiting else "dim")
+            cells.append(f"{run}{theme.paint('/', 'grey')}{wait}")
+        elif col.key == "reason":
+            capacity = sum(m.waiting_capacity for m in models)
+            deferred = sum(m.waiting_deferred for m in models)
+            if not (capacity or deferred):
+                cells.append(theme.paint("-", "dim"))
+            else:
+                cells.append(theme.paint(f"{capacity}/{deferred}", "bold"))
+        elif col.key == "nodes":
+            cells.append(theme.paint(f"{totals.busy_replicas}/{totals.replicas}", "bold"))
+        elif col.key == "status":
+            cells.append(theme.paint(f"{totals.active_models}/{totals.models} active", "bold"))
+        else:
+            # KV / AVG WAIT / WAIT MAX / QUEUED do not aggregate onto a fleet total
+            cells.append(theme.paint("-", "dim"))
+    return cells
+
+
+def render_gateway(aliases: Sequence[AliasUsage], theme: Theme, opts: RenderOptions) -> list[str]:
+    header = theme.paint("Gateway traffic by model alias", "bold")
+    if not aliases:
+        return [header, theme.paint("  no traffic in window", "grey")]
+    columns = [
+        Column("name", "ALIAS", align="left"),
+        Column("conc", "CONC", fixed=7),
+        Column("rpm", "REQ/MIN", fixed=9),
+        Column("tps", "OUT TOK/S", fixed=11),
+    ]
+    rows = []
+    for alias in aliases:
+        style = "cyan" if alias.is_active else "grey"
+        rows.append(
+            [
+                theme.paint(alias.name, style),
+                theme.paint(f"{alias.concurrency:.2f}", style),
+                theme.paint(f"{alias.requests_per_min:.1f}", style),
+                theme.paint(f"{alias.output_tokens_per_sec:.0f}", style),
+            ]
+        )
+    return [header, *format_table(columns, rows, width=opts.resolved_width(), theme=theme, separator=True)]
+
+
+def render_team(team: TeamOverview, theme: Theme, opts: RenderOptions) -> list[str]:
+    """Which API keys of a team are hitting which models, and how long those calls take.
+
+    Capped at ``opts.max_keys`` rows: this sits under the main table as a quick read.
+    The totals row and --json still cover every pair.
+    """
+    title = theme.paint(f"team {team.team_id}", "bold")
+    subtitle = theme.paint(team.summary(), "grey")
+    if not team.keys:
+        return [title, subtitle]
+
+    shown, hidden = team.keys[: opts.max_keys], team.keys[opts.max_keys :]
+
+    def mean_cell(seconds: float | None) -> str:
+        if seconds is None:
+            return theme.paint("-", "dim")
+        return theme.paint(format_duration(seconds), duration_style(seconds))
+
+    columns = [
+        Column("key", "API KEY", align="left"),
+        Column("model", "MODEL", align="left"),
+        Column("rpm", "REQ/MIN", fixed=8),
+        Column("mean", "MEAN SEC", fixed=9),
+    ]
+    rows = [
+        [
+            theme.paint(key.token_alias, "cyan"),
+            theme.paint(key.model, "blue"),
+            theme.paint(f"{key.req_per_min:.1f}", "bold"),
+            mean_cell(key.mean_seconds),
+        ]
+        for key in shown
+    ]
+    if hidden:
+        rows.append(
+            [
+                theme.paint(f"... {len(hidden)} more pair{'s' if len(hidden) != 1 else ''}", "grey"),
+                "",
+                theme.paint(f"{sum(k.req_per_min for k in hidden):.1f}", "grey"),
+                theme.paint("-", "dim"),
+            ]
+        )
+    total = [
+        theme.paint(f"{len(team.keys)} key/model pair{'s' if len(team.keys) != 1 else ''}", "bold"),
+        "",
+        theme.paint(f"{team.req_per_min:.1f}", "bold"),
+        theme.paint("-", "dim"),  # no weighted mean available across keys
+    ]
+    return [
+        title,
+        subtitle,
+        *format_table(
+            columns,
+            [*rows, total],
+            width=opts.resolved_width(),
+            theme=theme,
+            primary="key",
+            separator=True,
+        ),
+    ]
+
+
+def render_report(
+    snapshot: Snapshot,
+    models: Sequence[ModelUsage],
+    theme: Theme,
+    opts: RenderOptions,
+) -> str:
+    width = opts.resolved_width()
+    lines = render_header(snapshot, models, theme, opts)
+    lines.append("")
+    if not models:
+        # distinguish "your filter matched nothing" from "the fleet reported nothing"
+        message = (
+            "no models matched"
+            if snapshot.models
+            else "no models reporting data"
+        )
+        lines.append(theme.paint(message, "yellow"))
+    else:
+        specs = plan_rows(models, opts)
+        columns = plan_columns(specs, opts, width)
+        rows = [[cell_for(spec, col.key, theme, opts) for col in columns] for spec in specs]
+        rows.append(totals_row(models, columns, theme))
+        longest = max([len(spec.display) for spec in specs] + [len("MODEL")])
+        table = format_table(
+            columns,
+            rows,
+            width=width,
+            theme=theme,
+            primary_floor=longest if opts.full_names else 12,
+            separator=True,
+        )
+        # a blank line separates family blocks; a dashed rule separates the grand total
+        marks = ["blank" if index and specs[index - 1].ends_group else "" for index in range(len(specs))]
+        marks.append(TOTALS_MARK)
+        rule = theme.paint("-" * visible_len(table[0]), "dim")
+        lines += interleave_rows(table, marks, header_rows=2, rule=rule)
+        if snapshot.teams:
+            # a rule of the same weight divides the fleet view from this team's keys
+            lines.append(rule)
+            for index, team in enumerate(snapshot.teams):
+                if index:
+                    lines.append("")
+                lines += render_team(team, theme, opts)
+    if opts.show_gateway and snapshot.aliases is not None:
+        lines.append("")
+        lines += render_gateway(snapshot.aliases, theme, opts)
+    lines.append("")
+    if snapshot.errors:
+        shown = "; ".join(snapshot.errors[:2])
+        if len(snapshot.errors) > 2:
+            shown += f" (+{len(snapshot.errors) - 2} more)"
+        lines.append(theme.paint(clamp("! partial data: " + shown, width, theme), "yellow"))
+    footer = f"{snapshot.source}  ·  {snapshot.local_time()}"
+    lines.append(theme.paint(clamp(footer, width, theme), "grey"))
+    return "\n".join(lines)
+
+
+def render_quiet(models: Sequence[ModelUsage]) -> str:
+    """Two numbers for scripts: total running and total waiting."""
+    return f"{sum(m.running for m in models)} {sum(m.waiting for m in models)}"

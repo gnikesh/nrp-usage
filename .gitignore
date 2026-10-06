@@ -1,0 +1,15 @@
+__pycache__/
+.DS_Store
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.ruff_cache/
+.pytest_cache/
+.coverage
+*.token
+
+# agent working notes, not part of the published package
+MEMORY.md

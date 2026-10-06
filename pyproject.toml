@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nrp-usage"
+version = "0.1.0"
+description = "CLI showing live vLLM queue depth (requests running and waiting) per model on the NRP LLM platform"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Nikesh Gyawali" }]
+keywords = ["nrp", "nautilus", "vllm", "grafana", "prometheus", "cli", "llm", "monitoring"]
+dependencies = []
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: System Administrators",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: System :: Monitoring",
+  "Topic :: Utilities",
+]
+
+[project.scripts]
+nrp-usage = "nrp_usage.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/gnikesh/nrp-usage"
+Repository = "https://github.com/gnikesh/nrp-usage"
+Issues = "https://github.com/gnikesh/nrp-usage/issues"
+Dashboard = "https://grafana.nrp-nautilus.io/d/ad8bzhl/envoy-llms"
+
+[project.optional-dependencies]
+dev = ["ruff>=0.6"]
+
+[tool.setuptools.packages.find]
+include = ["nrp_usage*"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+# Pragmatic set: correctness and dead code first, style where it pays rent.
+select = ["E", "F", "W", "I", "UP", "B", "C4", "SIM", "RET", "ARG", "PIE", "RUF"]
+ignore = [
+  "RUF001",  # curly quotes/· in user-facing strings are intentional
+  "RUF002",
+  "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = [
+  "B008", "ARG001", "RET504",
+  "SIM117",  # stacked `with mock.patch(...)` reads better nested in assertions
+  "ARG005",  # stub lambdas must match the callback signature they replace
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
