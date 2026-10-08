@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from enum import Enum
 
 from .prometheus import Sample
+from .trend import Interval
 
 
 def by_label(samples: Sequence[Sample], label: str) -> dict[str, float]:
@@ -196,10 +197,37 @@ class KeyUsage:
     model: str
     req_per_min: float = 0.0
     mean_seconds: float | None = None  # mean request duration; None with no completed requests
+    in_tokens: float = 0.0  # counters are extrapolated by increase(), so keep the float
+    out_tokens: float = 0.0
+    reasoning_tokens: float = 0.0  # a subset of out_tokens, never additional to it
+    # production per recent --watch interval, oldest first; empty until enough frames exist
+    in_history: list[Interval] = field(default_factory=list)
+    out_history: list[Interval] = field(default_factory=list)
+
+    @property
+    def total_tokens(self) -> float:
+        return self.in_tokens + self.out_tokens
 
     @property
     def label(self) -> str:
         return self.token_alias
+
+    def slots(self, count: int) -> list[tuple[Interval | None, Interval | None]]:
+        """The last ``count`` (input, output) interval pairs, oldest first.
+
+        Not-yet-filled columns stay empty on the left, so the newest reading is always the
+        right-hand one rather than sliding across the strip as frames arrive.
+        """
+        if not self.in_history and not self.out_history:
+            return [(None, None)] * count
+        if max(len(self.in_history), len(self.out_history)) < count:
+            return [(None, None)] * count
+        ins, outs = self.in_history[-count:], self.out_history[-count:]
+
+        def align(items: list[Interval]) -> list[Interval | None]:
+            return [None] * (count - len(items)) + list(items)
+
+        return list(zip(align(ins), align(outs), strict=True))
 
 
 @dataclass
@@ -213,6 +241,23 @@ class TeamOverview:
     @property
     def req_per_min(self) -> float:
         return sum(k.req_per_min for k in self.keys)
+
+    @property
+    def in_tokens(self) -> float:
+        return sum(k.in_tokens for k in self.keys)
+
+    @property
+    def out_tokens(self) -> float:
+        return sum(k.out_tokens for k in self.keys)
+
+    @property
+    def reasoning_tokens(self) -> float:
+        """Included in ``out_tokens``; report it, never add it."""
+        return sum(k.reasoning_tokens for k in self.keys)
+
+    @property
+    def total_tokens(self) -> float:
+        return self.in_tokens + self.out_tokens
 
     @property
     def token_aliases(self) -> int:
@@ -239,25 +284,39 @@ def build_team_overview(
     window: str = "15m",
     *,
     min_req_per_min: float = 0.0,
+    in_tokens: Mapping[tuple[str, str], float] | None = None,
+    out_tokens: Mapping[tuple[str, str], float] | None = None,
+    reasoning_tokens: Mapping[tuple[str, str], float] | None = None,
 ) -> TeamOverview:
-    """Merge the per-(key, model) rate and duration results into one overview.
+    """Merge the per-(key, model) rate, duration and token results into one overview.
 
     Series with no traffic in the window still carry a zero-valued counter, so idle
-    pairs are dropped rather than filling the report with 0.0 lines.
+    pairs are dropped rather than filling the report with 0.0 lines. Reasoning tokens
+    are a subset of output (verified: reasoning never exceeds output), so they are
+    carried separately and must never be added to the output total.
     """
+    in_tokens = in_tokens or {}
+    out_tokens = out_tokens or {}
+    reasoning_tokens = reasoning_tokens or {}
     pairs: list[KeyUsage] = []
     for (token_alias, model), value in rpm.items():
         if value <= min_req_per_min:
             continue
+        pair = (token_alias, model)
         pairs.append(
             KeyUsage(
                 token_alias=token_alias,
                 model=model,
                 req_per_min=value,
-                mean_seconds=mean.get((token_alias, model)),
+                mean_seconds=mean.get(pair),
+                in_tokens=in_tokens.get(pair, 0.0),
+                out_tokens=out_tokens.get(pair, 0.0),
+                reasoning_tokens=min(reasoning_tokens.get(pair, 0.0), out_tokens.get(pair, 0.0)),
             )
         )
-    pairs.sort(key=lambda p: (-p.req_per_min, p.token_alias.casefold(), p.model.casefold()))
+    # Stable order, not busiest-first: this table is a per-key ledger read across --watch
+    # frames, and rows that swap positions each frame are unreadable.
+    pairs.sort(key=lambda p: (p.token_alias.casefold(), p.model.casefold()))
     return TeamOverview(team_id=team_id, window=window, keys=pairs)
 
 
@@ -303,7 +362,7 @@ class Snapshot:
 
     def headline(self, models: Sequence[ModelUsage] | None = None, *, label: str = "", width: int = 0) -> str:
         """Summary line for the given selection (defaults to the whole snapshot)."""
-        return headline(self.models if models is None else models, label=label, width=width, window=self.window)
+        return headline(self.models if models is None else models, label=label, width=width)
 
     def local_time(self, fmt: str = "%H:%M:%S") -> str:
         return self.fetched_at.astimezone().strftime(fmt)
@@ -331,6 +390,9 @@ class Snapshot:
                     "team_id": team.team_id,
                     "window": team.window,
                     "req_per_min": round(team.req_per_min, 3),
+                    "in_tokens": round(team.in_tokens),
+                    "out_tokens": round(team.out_tokens),
+                    "reasoning_tokens": round(team.reasoning_tokens),
                     "token_aliases": team.token_aliases,
                     "models": team.models,
                     "keys": [asdict(k) for k in team.keys],
@@ -342,7 +404,7 @@ class Snapshot:
         }
 
 
-def headline(models: Sequence[ModelUsage], *, label: str = "", width: int = 0, window: str = "") -> str:
+def headline(models: Sequence[ModelUsage], *, label: str = "", width: int = 0) -> str:
     """One-line summary of a set of models, naming whatever has a queue.
 
     Parts are appended in descending importance, so when ``width`` is tight the
@@ -352,16 +414,12 @@ def headline(models: Sequence[ModelUsage], *, label: str = "", width: int = 0, w
     if not models:
         return "no data"  # never claim "no queues" for a fleet we could not read
     queued = sorted((m for m in models if m.queued), key=lambda m: -m.waiting)
-    peaked = sorted((m for m in models if m.waiting_peak), key=lambda m: -m.waiting_peak)
     parts = [f"{totals.running} running", f"{totals.waiting} waiting"]
     if queued:
         parts.append("queued on " + ", ".join(f"{m.short_name} +{m.waiting}" for m in queued[:3]))
-    elif peaked:
-        # a waiting gauge drains in seconds, so "no queues" alone misleads. This rides in the same
-        # clause because trailing clauses are the first thing dropped on a narrow terminal.
-        span = f" in the last {window}" if window else ""
-        parts.append(f"no queues now, up to {peaked[0].waiting_peak} queued{span}")
     else:
+        # the dedicated "busiest queue" line below carries any recent-queue context, with the
+        # model name; repeating it here only pushes other clauses off narrow terminals
         parts.append("no queues")
     if totals.waiting:
         parts.append(f"{totals.queued_models} model{'s' if totals.queued_models != 1 else ''} queued")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 import unittest
 from datetime import datetime, timezone
 
@@ -151,8 +152,10 @@ class TestTeamQueries(unittest.TestCase):
         self.assertIn("_count{", mean)
 
     def test_each_team_gets_its_own_scoped_queries(self):
+        # 6 per team: rate, mean duration, in/out/reasoning counters, and the raw
+        # cumulative counter that frame-to-frame arrows are computed from
         queries = build_queries(window="5m", overview_teams=["a", "b"])
-        self.assertEqual(len([k for k in queries if k.startswith("team_")]), 4)
+        self.assertEqual(len([k for k in queries if k.startswith("team_")]), 12)
         self.assertIn('team_id=~"^(a)$"', queries["team_rpm[a]"])
         self.assertNotIn("(b)", queries["team_rpm[a]"])
 
@@ -219,6 +222,86 @@ class TestTeamQueries(unittest.TestCase):
             "sum by (team_id) (rate(gen_ai_server_request_duration_seconds_count[15m])) * 60",
         )
 
+    def test_token_queries_cover_all_three_types(self):
+        queries = build_queries(window="15m", overview_teams=["acme-lab"])
+        for suffix, token_type in (("tin", "input"), ("tout", "output"), ("treason", "reasoning")):
+            expr = queries[f"team_{suffix}[acme-lab]"]
+            self.assertIn(f'gen_ai_token_type="{token_type}"', expr)
+            self.assertIn("increase(", expr)
+            self.assertIn("gen_ai_client_token_usage_sum", expr)
+            self.assertIn('team_id=~"^(acme-lab)$"', expr)
+            self.assertIn("[15m]", expr)
+
+    def test_token_maps_reach_the_overview(self):
+        results = {
+            "running": vector([("Qwen/a", 5)]),
+            "waiting": vector([]),
+            "replicas": vector([("Qwen/a", 1)]),
+            "busy_replicas": vector([]),
+            "kv_cache": vector([]),
+            "queue_avg": vector([]),
+            "queue_rate": vector([]),
+            "waiting_reason": vector([]),
+            "waiting_peak": vector([]),
+            "waiting_share": vector([]),
+            "team_rpm[t1]": vector([(("token_alias", "k1"), ("gen_ai_original_model", "m1"), 3.0)]),
+            "team_mean[t1]": vector([(("token_alias", "k1"), ("gen_ai_original_model", "m1"), 1.5)]),
+            "team_tin[t1]": vector([(("token_alias", "k1"), ("gen_ai_original_model", "m1"), 7_104_961.4)]),
+            "team_tout[t1]": vector([(("token_alias", "k1"), ("gen_ai_original_model", "m1"), 33_962.0)]),
+            "team_treason[t1]": vector([(("token_alias", "k1"), ("gen_ai_original_model", "m1"), 21_671.0)]),
+        }
+        team = make_snapshot(results, source="unit", window="15m").teams[0]
+        key = team.keys[0]
+        self.assertEqual((round(key.in_tokens), round(key.out_tokens)), (7_104_961, 33_962))
+        self.assertEqual(round(key.reasoning_tokens), 21_671)
+        self.assertEqual(round(team.in_tokens), 7_104_961)
+
+    def test_reasoning_never_exceeds_output(self):
+        # increase() extrapolates, so a rounding wobble must not imply extra tokens
+        results = {
+            "running": vector([]), "waiting": vector([]), "replicas": vector([]),
+            "busy_replicas": vector([]), "kv_cache": vector([]), "queue_avg": vector([]),
+            "queue_rate": vector([]), "waiting_reason": vector([]), "waiting_peak": vector([]),
+            "waiting_share": vector([]),
+            "team_rpm[t1]": vector([(("token_alias", "k"), ("gen_ai_original_model", "m"), 3.0)]),
+            "team_mean[t1]": vector([]),
+            "team_tin[t1]": vector([]),
+            "team_tout[t1]": vector([(("token_alias", "k"), ("gen_ai_original_model", "m"), 100.0)]),
+            "team_treason[t1]": vector([(("token_alias", "k"), ("gen_ai_original_model", "m"), 104.0)]),
+        }
+        key = make_snapshot(results, source="unit").teams[0].keys[0]
+        self.assertEqual(key.reasoning_tokens, 100.0)
+
+    def test_missing_token_data_is_zero_not_none(self):
+        results = {
+            "running": vector([]), "waiting": vector([]), "replicas": vector([]),
+            "busy_replicas": vector([]), "kv_cache": vector([]), "queue_avg": vector([]),
+            "queue_rate": vector([]), "waiting_reason": vector([]), "waiting_peak": vector([]),
+            "waiting_share": vector([]),
+            "team_rpm[t1]": vector([(("token_alias", "k"), ("gen_ai_original_model", "m"), 3.0)]),
+            "team_mean[t1]": vector([]),
+        }
+        key = make_snapshot(results, source="unit").teams[0].keys[0]
+        self.assertEqual((key.in_tokens, key.out_tokens, key.reasoning_tokens), (0.0, 0.0, 0.0))
+
+    def test_json_carries_token_totals(self):
+        results = {
+            "running": vector([]), "waiting": vector([]), "replicas": vector([]),
+            "busy_replicas": vector([]), "kv_cache": vector([]), "queue_avg": vector([]),
+            "queue_rate": vector([]), "waiting_reason": vector([]), "waiting_peak": vector([]),
+            "waiting_share": vector([]),
+            "team_rpm[t1]": vector([(("token_alias", "k"), ("gen_ai_original_model", "m"), 3.0)]),
+            "team_mean[t1]": vector([]),
+            "team_tin[t1]": vector([(("token_alias", "k"), ("gen_ai_original_model", "m"), 1500.0)]),
+            "team_tout[t1]": vector([(("token_alias", "k"), ("gen_ai_original_model", "m"), 250.0)]),
+            "team_treason[t1]": vector([(("token_alias", "k"), ("gen_ai_original_model", "m"), 90.0)]),
+        }
+        entry = make_snapshot(results, source="unit").to_dict()["teams"][0]
+        self.assertEqual(entry["in_tokens"], 1500)
+        self.assertEqual(entry["out_tokens"], 250)
+        self.assertEqual(entry["reasoning_tokens"], 90)
+        self.assertEqual(entry["keys"][0]["in_tokens"], 1500.0)
+
     def test_json_includes_the_team_section(self):
         results = {
             "running": vector([("Qwen/a", 5)]),
@@ -267,8 +350,9 @@ class TestContentionAssembly(unittest.TestCase):
         self.assertIsNone(snap.models[0].queued_share)
         self.assertIn("waiting_share", snap.errors[0])
 
-    def test_headline_shows_recent_queueing_when_now_is_clear(self):
-        self.assertIn("no queues now, up to 12 queued in the last 15m", self.base().headline())
+    def test_headline_keeps_live_queue_detail_on_its_own_line(self):
+        snap = self.base(waiting=vector([("Qwen/a", 3)]))
+        self.assertIn("queued on a +3", snap.headline())
 
     def test_headline_prefers_the_live_queue_over_the_peak(self):
         snap = self.base(waiting=vector([("Qwen/a", 3)]))
@@ -364,6 +448,20 @@ class _StubClient:
     def query_many(self, queries):
         self.seen = dict(queries)
         return {name: self.results.get(name, vector([])) for name in queries}
+
+
+class TestFetchSnapshotTiming(unittest.TestCase):
+    def test_snapshot_is_stamped_when_queries_run_not_when_assembly_ends(self):
+        # the footer time is the instant the samples were read, so re-querying at
+        # snapshot.fetched_at reproduces what is displayed
+        class TimingClient:
+            def query_many(self, queries):
+                time.sleep(0.05)
+                return {name: vector([]) for name in queries}
+
+        snap = fetch_snapshot(TimingClient(), source="unit", window="5m")
+        age = (datetime.now(timezone.utc) - snap.fetched_at).total_seconds()
+        self.assertGreaterEqual(age, 0.05)
 
 
 class TestFetchSnapshot(unittest.TestCase):

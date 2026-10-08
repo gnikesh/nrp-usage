@@ -20,8 +20,10 @@ from nrp_usage.render import (
     render_gateway,
     render_quiet,
     render_report,
+    render_team,
     strip_ansi,
 )
+from nrp_usage.trend import Interval, Trend
 from nrp_usage.usage import make_snapshot
 from tests.fakes import vector
 
@@ -146,7 +148,7 @@ class TestColumnPlanning(unittest.TestCase):
         )
         self.assertEqual(self.cols(models, width=88), ["name", "runwait", "waitmax", "queued", "nodes", "status"])
         self.assertEqual(self.cols(models, width=80), ["name", "runwait", "waitmax", "queued", "status"])
-        cramped = self.cols(models, width=66)
+        cramped = self.cols(models, width=60)
         self.assertEqual(cramped, ["name", "runwait", "status"])
         # what always survives is the answer itself
         self.assertTrue({"name", "runwait", "status"} <= set(cramped))
@@ -500,11 +502,13 @@ class TestHeaderAndFooter(unittest.TestCase):
         self.assertIn("GLM-5 +7", rendered)
         self.assertIn("busiest queue", rendered)
 
-    def test_headline_when_clear(self):
+    def test_headline_stays_about_the_present_moment(self):
+        # recent-queue context lives on the reserved "busiest queue" line, which has its own
+        # line and so survives narrow terminals far better than a trailing clause
         models = [model("a/b", running=2)]
         rendered = render_report(snapshot(*models), models, Theme(color=False), RenderOptions(width=120))
-        self.assertIn("no queues", rendered)
-        self.assertNotIn("busiest queue", rendered)
+        self.assertIn("no queues", rendered.splitlines()[1])
+        self.assertNotIn("busiest queue", rendered.splitlines()[1])
 
     def test_footer_shows_source_and_time(self):
         rendered = render_report(snapshot(model("a")), [model("a")], Theme(color=False), RenderOptions(width=100))
@@ -547,6 +551,48 @@ class TestGateway(unittest.TestCase):
     def test_empty_gateway(self):
         lines = render_gateway([], Theme(color=False), RenderOptions(width=100))
         self.assertIn("no traffic", "\n".join(lines))
+
+
+class TestLayoutDoesNotShift(unittest.TestCase):
+    """The fleet table must start on the same line whether or not anything is queued."""
+
+    theme = Theme(color=False)
+
+    def body(self, rows, **over):
+        snap = snapshot(*rows)
+        return render_report(snap, rows, self.theme, RenderOptions(width=104, **over)).splitlines()
+
+    def table_row(self, lines):
+        return next(i for i, line in enumerate(lines) if line.startswith("MODEL"))
+
+    def test_busiest_queue_line_is_always_present(self):
+        quiet = [model("a/b", running=9, replicas=1)]
+        busy = [model("a/b", running=9, waiting=12, replicas=1)]
+        assert self.body(quiet)[3].startswith("busiest queue:")
+        assert self.body(busy)[3].startswith("busiest queue:")
+
+    def test_table_starts_at_the_same_line_in_every_state(self):
+        states = {
+            "idle, never queued": [model("a/b", running=9, replicas=1)],
+            "idle, queued earlier": [model("a/b", running=9, replicas=1, waiting_peak=31)],
+            "queued, no timing": [model("a/b", running=9, waiting=12, replicas=1)],
+            "queued, with timing": [model("a/b", running=9, waiting=12, replicas=1, queue=4.2)],
+            "nothing at all": [model("a/b", replicas=1)],
+        }
+        positions = {name: self.table_row(self.body(rows)) for name, rows in states.items()}
+        assert len(set(positions.values())) == 1, positions
+
+    def test_unknown_mean_wait_is_omitted_not_dashed(self):
+        # a fresh queue has no completed requests to average; "(- mean wait)" reads as broken
+        line = self.body([model("a/b", running=9, waiting=12, replicas=1)])[3]
+        assert "mean wait" not in line, line
+        assert "12 waiting" in line, line
+        known = self.body([model("a/b", running=9, waiting=12, replicas=1, queue=4.2)])[3]
+        assert "4.20s mean wait" in known, known
+
+    def test_recent_queue_names_the_window_and_the_model(self):
+        line = self.body([model("Inferact/GLM-5.3-NVFP4", running=9, replicas=1, waiting_peak=31)])[3]
+        assert line == "busiest queue: none now, up to 31 in the last 15m on GLM-5.3-NVFP4", line
 
 
 class TestTeamSection(unittest.TestCase):
@@ -602,8 +648,8 @@ class TestTeamSection(unittest.TestCase):
     def test_long_lists_are_capped_with_the_remainder_accounted(self):
         keys = [KeyUsage(f"key-{i}", "qwen3", float(i), 1.0) for i in range(1, 13)]
         body = self.render(self.snap(self.team(keys=keys)), max_keys=8)
-        self.assertIn("... 4 more pairs", body)
-        self.assertIn("12 key/model pairs", body)
+        self.assertIn("... +4", body)
+        self.assertIn("12 pairs", body)
         self.assertEqual(body.count("key-"), 8)  # only the first 8 are listed
 
     def test_no_truncation_when_within_the_cap(self):
@@ -634,6 +680,143 @@ class TestTeamSection(unittest.TestCase):
             [strip_ansi(line) for line in plain.splitlines()],
             [strip_ansi(line) for line in colored.splitlines()],
         )
+
+
+def next_line_starting_with(prefix: str):
+    """A finder for a rendered line by its prefix, so assertions stay readable."""
+
+    def find(text: str) -> str:
+        return next(line for line in text.splitlines() if line.startswith(prefix))
+
+    return find
+
+
+class TestTokenStrip(unittest.TestCase):
+    """The per-frame IN/OUT history strip in the team section."""
+
+    theme = Theme(color=False)
+
+    def iv(self, tokens, trend=Trend.FLAT):
+        return Interval(tokens, tokens / 5.0, 5.0, trend)
+
+    def key(self, **over):
+        base = {
+            "token_alias": "main", "model": "qwen3", "req_per_min": 41.2, "mean_seconds": 9.6,
+            "in_tokens": 42_300_000, "out_tokens": 52_600, "reasoning_tokens": 25_700,
+            "in_history": [self.iv(1000, Trend.FLAT), self.iv(3_050, Trend.UP), self.iv(2_900, Trend.FLAT)],
+            "out_history": [self.iv(80, Trend.FLAT), self.iv(210, Trend.UP), self.iv(600, Trend.UP)],
+        }
+        base.update(over)
+        return KeyUsage(**base)
+
+    def render(self, *keys, **over):
+        team = TeamOverview("acme-lab", "15m", list(keys) or [self.key()])
+        return "\n".join(render_team(team, self.theme, RenderOptions(**{"width": 140, **over})))
+
+    def header_line(self, body):
+        return next(line for line in body.splitlines() if line.startswith("API KEY"))
+
+    def test_three_frame_columns_oldest_left_newest_right(self):
+        # age-labelled so the reader knows which side is current
+        assert "IN/OUT -2" in self.header_line(self.render())
+
+    def test_cell_shows_input_slash_output_each_arrowed(self):
+        body = self.render()
+        assert "\u21921.0K/\u219280" in body, body      # oldest slot
+        assert "\u21913.0K/\u2191210" in body, body      # middle slot
+        assert "\u21922.9K/\u2191600" in body, body      # newest slot
+
+    def test_newest_reading_is_the_rightmost_frame_column(self):
+        single = self.key(in_history=[self.iv(7, Trend.UP)], out_history=[self.iv(3, Trend.UP)])
+        body = self.render(single)
+        row = next(line for line in body.splitlines() if line.startswith("main"))
+        assert row.rstrip().endswith("25.7K"), row      # REASON sits after the strip
+        strip = [part for part in row.split() if "/" in part and any(a in part for a in "\u2191\u2193\u2192")]
+        assert strip[-1] == "\u21917/\u21913", strip
+
+    def test_no_history_shows_no_strip(self):
+        # one-shot mode has nothing to compare, so it must not reserve 42 columns of placeholders
+        fresh = self.key(in_history=[], out_history=[])
+        body = self.render(fresh)
+        assert "15m IN/OUT" in body                    # window column remains
+        assert "IN/OUT now" not in body                # no frame columns
+        assert "\u00b7/\u00b7" not in body, body      # no empty frame cells
+        assert "--watch" in body, body                 # and it says how to get them
+
+    def test_watching_reserves_the_strip_so_the_table_never_changes_shape(self):
+        # without reserved columns the table gains three columns between frame 1 and frame 2
+        fresh = self.key(in_history=[], out_history=[])
+        body = self.render(fresh, history_reserved=True)
+        assert "IN/OUT now" in body and "IN/OUT -2" in body
+        assert body.count("\u00b7/\u00b7") == 6, body  # 3 slots x (data row + totals row)
+        head = next_line_starting_with("API KEY")
+        assert head(body) == head(self.render()), (head(body), head(self.render()))
+
+    def test_pair_cells_are_never_truncated(self):
+        # at 12 wide a 14-char pair silently lost its unit: "810.0K/270.0"
+        huge = self.key(
+            in_tokens=810_000, out_tokens=270_000,
+            in_history=[self.iv(99_900, Trend.UP)] * 3, out_history=[self.iv(99_900, Trend.UP)] * 3,
+        )
+        body = self.render(huge)
+        assert "810.0K/270.0K" in body, body
+        assert "\u219199.9K/\u219199.9K" in body, body
+
+    def test_rendering_preserves_the_order_it_is_given(self):
+        # reordering on volume happens in build_team_overview; the renderer must not shuffle
+        loud = self.key(token_alias="batch", model="glm-5", req_per_min=500.0)
+        quiet = self.key(token_alias="alpha", model="qwen3", req_per_min=1.0)
+        body = self.render(loud, quiet)
+        names = [line.split()[0] for line in body.splitlines() if line.startswith(("alpha", "batch"))]
+        assert names == ["batch", "alpha"], names
+
+    def test_partial_history_pads_on_the_left(self):
+        partial = self.key(
+            in_history=[self.iv(500, Trend.FLAT), self.iv(900, Trend.UP)],
+            out_history=[self.iv(50, Trend.FLAT), self.iv(90, Trend.UP)],
+        )
+        body = self.render(partial)
+        row = next(line for line in body.splitlines() if line.startswith("main"))
+        assert "\u2191900/\u219190" in row, row     # newest still lands in the right-hand column
+        assert row.count("\u00b7/\u00b7") == 1, row  # only the leftmost slot is empty
+
+    def test_history_length_is_configurable(self):
+        five = self.key(
+            in_history=[self.iv(i * 100, Trend.FLAT) for i in range(1, 6)],
+            out_history=[self.iv(i * 10, Trend.FLAT) for i in range(1, 6)],
+        )
+        assert self.header_line(self.render(five)).count("IN/OUT -") == 2       # -2 and -1
+        assert "IN/OUT now" in self.header_line(self.render(five))
+        assert "IN/OUT -4" in self.header_line(self.render(five, history_slots=5))
+
+    def test_totals_row_folds_the_strip_across_rows(self):
+        second = self.key(
+            token_alias="batch", model="glm-5",
+            in_history=[self.iv(1_000, Trend.UP)] * 3, out_history=[self.iv(100, Trend.UP)] * 3,
+        )
+        body = self.render(self.key(), second)
+        totals = next(line for line in body.splitlines() if line.startswith("2 pairs"))
+        # each column folds the same slot across rows: newest = 2.9K+1.0K in / 600+100 out
+        assert "\u21913.9K/\u2191700" in totals, totals
+
+    def test_reason_is_still_explained_as_a_subset(self):
+        body = self.render(history_slots=1, width=200)
+        assert "REASON is part of its OUT" in body, body
+
+    def test_coloured_strip_matches_plain_layout(self):
+        plain = self.render()
+        colored = render_team(
+            TeamOverview("acme-lab", "15m", [self.key()]), Theme(color=True), RenderOptions(width=140)
+        )
+        assert [strip_ansi(x) for x in plain.splitlines()] == [strip_ansi(x) for x in colored]
+
+    def test_arrows_survive_narrow_widths_without_mangling(self):
+        for width in (78, 92, 108, 126):
+            body = self.render(width=width)
+            for line in body.splitlines():
+                assert len(strip_ansi(line)) <= width, (width, line)
+            row = next(line for line in body.splitlines() if line.startswith("main"))
+            assert "\u21913.0K" in row and "\u2191600" in row, (width, row)
 
 
 class TestQuiet(unittest.TestCase):

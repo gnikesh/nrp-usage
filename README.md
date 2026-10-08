@@ -17,35 +17,37 @@ batch run, or an agent loop and pick a model that will actually answer.
 <summary>Same output as text</summary>
 
 ```
+$ nrp-usage
 NRP model usage
-50 running · 0 waiting · no queues now, up to 5 queued in the last 15m · 7/11 models active
+53 running · 2 waiting · queued on Qwen3.8-Flash-Next-FP8 +1, GLM-5.3-NVFP4 +1 · 2 models queued
 WAIT MAX, QUEUED and AVG WAIT cover the last 15m
+busiest queue: Qwen3.8-Flash-Next-FP8 (1 waiting, 380ms mean wait so far)
 
-MODEL                           RUN/WAIT    WAIT MAX    QUEUED    NODES         KV CACHE    AVG WAIT   STATUS
--------------------------------------------------------------------------------------------------------------
-DeepSeek-V4-Flash-Vision-Exp         3/0           0        0%      2/2    ········   4%        <1ms   serving
+MODEL                           RUN/WAIT    WAIT MAX    QUEUED    NODES   STATUS
+--------------------------------------------------------------------------------
+DeepSeek-V4-Flash-Vision-Exp         0/0           0        0%      0/2   idle
 
-gemma (3 models)                     7/0           -         -      1/9    █·······  15%           -   serving
-  gemma-4-31B-it-qat-w4a16-ct        7/0           0        0%      1/3    █·······  15%        <1ms   serving
-  gemma-4-12B-it-qat-w4a16-ct        0/0           0        0%      0/5    ········   0%        <1ms   idle
-  gemma-4-E4B-it                     0/0           0        0%      0/1    ········   0%           -   idle
+gemma (3 models)                     8/0           -         -      3/9   serving
+  gemma-4-31B-it-qat-w4a16-ct        8/0           0        0%      3/3   serving
+  gemma-4-12B-it-qat-w4a16-ct        0/0           0        0%      0/5   idle
+  gemma-4-E4B-it                     0/0           0        0%      0/1   idle
 
-GLM-5.3-NVFP4                       11/0           5       18%      2/2    ███·····  39%       237ms   serving
+GLM-5.3-NVFP4                       12/1          10       38%      2/2   queued
 
-gpt-oss-120b                         4/0           5        8%      1/1    ········   5%       211ms   serving
+gpt-oss-120b                         5/0           0        0%      1/1   serving
 
-Kimi-K2.7-Code                       3/0           0        0%      1/1    ········   5%        <1ms   serving
+Kimi-K2.7-Code                       2/0           0        0%      1/1   serving
 
-MiniMax-M2.7                         0/0           0        0%      0/1    ········   0%         4ms   idle
+MiniMax-M2.7                         0/0           0        0%      0/1   idle
 
-Qwen (3 models)                     22/0           -         -      5/7    █·······  17%           -   serving
-  Qwen3.8-27B                       20/0           3        5%      3/3    █·······  17%        64ms   serving
-  Qwen3.8-Flash-Next-FP8             2/0           1        2%      2/2    ········   1%        51ms   serving
-  Qwen3-VL-Embedding-8B              0/0           0        0%      0/2    ········   0%        <1ms   idle
--------------------------------------------------------------------------------------------------------------
-TOTAL                               50/0           -         -    12/23                -           -   7/11 active
+Qwen (3 models)                     26/1           -         -      5/7   queued
+  Qwen3.8-Flash-Next-FP8            13/1           7       23%      2/2   queued
+  Qwen3.8-27B                       13/0           0        2%      3/3   serving
+  Qwen3-VL-Embedding-8B              0/0           0        0%      0/2   idle
+--------------------------------------------------------------------------------
+TOTAL                               53/2           -         -    12/23   6/11 active
 
-https://grafana.nrp-nautilus.io  ·  17:05:06
+https://grafana.nrp-nautilus.io  ·  21:32:01
 ```
 
 </details>
@@ -112,8 +114,8 @@ ln -sf "$PWD/venv/bin/nrp-usage" ~/.local/bin/nrp-usage   # available without ac
 ## Pointing it at your team
 
 The fleet table needs no account or configuration. Separately, you can add a short section under
-`TOTAL` covering **your** traffic: which API keys are in use, which models they call, how many
-requests/minute, and the mean duration of those calls.
+`TOTAL` covering **your** traffic: which API keys are in use, which models they call, at how many
+requests/minute, the mean duration of those calls, and the input/output token volume.
 
 It is opt-in and defaults to nothing, because a fresh install has no business showing anyone's API key
 aliases. Enable it with `--team` (repeatable) or `NRP_TEAMS` (comma separated).
@@ -135,30 +137,62 @@ use one of them:  nrp-usage --team alpha-research-lab
 Team ids are also in the dashboard's `team_id` dropdown and match your platform account name.
 
 ```
-$ nrp-usage --team acme-lab        # the section added under TOTAL
---------------------------------------------------------------------------------
+$ nrp-usage --team acme-lab --watch        # the section added under TOTAL
+-----------------------------------------------------------------------------------------------------
 team acme-lab
-49.2 req/min across 3 keys and 3 models
-API KEY             MODEL    REQ/MIN    MEAN SEC
-------------------------------------------------
-main                qwen3       41.2       9.60s
-nightly-batch       glm-5        6.8      52.40s
-dev-scratch         gemma        0.9       1.40s
-dev-scratch         qwen3        0.3       600ms
-4 key/model pairs               49.2           -
+50.2 req/min across 3 keys and 3 models
+the 3 IN/OUT columns are the last 3 frames, oldest left / newest right · arrows compare each frame's rate with the one before
+API KEY         MODEL    REQ/MIN    MEAN SEC       IN/OUT -2       IN/OUT -1      IN/OUT now   15m IN/OUT
+---------------------------------------------------------------------------------------------------------
+main            qwen3       41.2       9.60s     ↑1.2K/↑340      ↑1.1K/↑310     ↑1.4K/↑290   42.3M/52.6K
+nightly-batch   glm-5        6.8      52.40s        ↓40/↓12         ↓38/↓9         ↓0/↓0      8.1M/41.2K
+dev-scratch     gemma        0.9       1.40s         →0/→0           →0/→0          →0/→0      120.0K/4.1K
+3 pairs                     48.9           -     ↑1.2K/↑352      ↑1.1K/↑319     ↑1.4K/↑290    50.6M/97.9K
 ```
 
-That example covers the behaviours worth knowing:
+Each `IN/OUT` column is **one `--watch` frame**: how many tokens that key produced on that model in
+that interval, input and output, each arrowed against its own previous frame. Three columns, oldest on
+the left, the newest reading on the right, so a ramp or a fade is visible at a glance: `main` is
+accelerating, `nightly-batch` has stopped, `dev-scratch` has been idle all along.
+
+- **Why the arrow is not on the 15m number.** `increase(...[15m])` is dominated by which samples fall
+  off the left edge of the window, so an idle model's window total still drifts upward. Measured live:
+  a model that produced *nothing* in 6 seconds showed its 15m figure rise by 2. The strip is therefore
+  built from the raw cumulative counter, sampled once per frame and differenced.
+- **A counter only rises, so "decreasing" is relative.** Each arrow compares that interval's production
+  *rate* with the interval before it, normalised per second so a slow frame is not mistaken for a
+  surge. `↑` faster, `↓` slower, `→` within 10%.
+- **Two intervals must close before an arrow exists**, so the first frames show counts and `·/·`
+  placeholders. The columns are reserved from frame one while watching, so the table never changes
+  shape mid-session. The strip is a `--watch` feature: plain `nrp-usage` has no frame columns
+  at all and shows a single `15m IN/OUT` total instead.
+- `TOTAL` is gone on purpose: pairing a running maximum with a waiting maximum implies a moment that
+  never happened, and the newest column already gives you the current rate.
+- Row order is stable (API key, then model), never by volume, because rows that swap each frame are
+  unreadable in a ledger you are watching.
+- Widths are fixed rather than content-derived; a 12-wide cell silently ate the unit from
+  `810.0K/270.0K`. When the terminal is narrow, `REQ/MIN`, `MEAN SEC`, `15m IN/OUT` and `REASON` drop
+  before the strip does.
+
+`REASON`, when there is room, is a subset of output rather than a third stream: across 395 team/model
+pairs, reasoning exceeded output zero times, so it is never added into any total.
+
+That example covers the other behaviours worth knowing:
 
 - **Zero-traffic pairs are hidden.** A team may have five key × model pairs in the counters while only
   four did anything in the window; the fifth would be a row of zeroes.
 - `MEAN SEC` is real wall time per request (`rate(_sum) / rate(_count)`), so long streaming calls
-  legitimately show tens of seconds. Above 30s it turns red, as `nightly-batch` would.
+  legitimately show tens of seconds. Above 30s it turns red, as `nightly-batch` shows.
+- **`REASON` is a subset of `OUT`, never additional to it.** Reasoning models report thinking tokens
+  separately, but they are already counted inside output, so the column is labelled *of which* and is
+  excluded from every total. Adding it would double-count. It only appears when some key actually
+  reasons, and shows `-` for models that do not. Verified: across 395 team/model pairs and again across
+  552 key/model pairs, reasoning exceeded output zero times.
 - One key can appear on several rows because each model is tracked separately.
 - The totals row leaves `MEAN SEC` blank on purpose: averaging the per-pair means without weighting by
   request count would misrepresent the team.
-- The list caps at `--keys N` (default 8); the `... N more pairs` row carries their combined rate, and
-  `--json` always returns everything.
+- The list caps at `--keys N` (default 8); the `... +N` row carries the hidden pairs' combined rate and
+  tokens, and `--json` always returns everything.
 
 ## Reading the output
 
@@ -226,7 +260,9 @@ while ! nrp-usage -x -q qwen3 >/dev/null; do sleep 30; done
 ```
 
 `--json` output is stable per-model data (with `short_name`, `family`, `queued_share`, `waiting_peak`)
-plus a `families` rollup and the `teams` section. Display caps such as `--keys` do not apply to it.
+plus a `families` rollup and the `teams` section. Each team row carries its full interval history
+(`in_history` / `out_history`, each with tokens, rate, seconds and trend), so you can chart it yourself.
+Display caps such as `--keys` do not apply to it.
 
 **Exit codes:** `0` ok · `1` `--exit-if-busy` matched a queue · `2` the question could not be answered
 · `130` interrupted.
@@ -315,7 +351,7 @@ Things that look like they should be one way and are not:
 ```bash
 source venv/bin/activate
 pip install -e '.[dev]'
-python -m unittest discover -s tests -t .   # 268 tests, fully offline
+python -m unittest discover -s tests -t .   # 314 tests, fully offline
 ruff check .
 nrp-usage --explain --gateway               # inspect the queries
 ```

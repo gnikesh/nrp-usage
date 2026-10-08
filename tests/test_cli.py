@@ -416,12 +416,65 @@ class TestListTeamsCli(unittest.TestCase):
         self.assertNotIn("RUN/WAIT", out.getvalue())
 
 
+class TestStripOnlyInWatch(unittest.TestCase):
+    """Plain runs get one IN/OUT column; -w gets the multi-frame strip."""
+
+    def team(self, **over):
+        base = {"req_per_min": 40.0, "mean_seconds": 0.7, "in_tokens": 62_800, "out_tokens": 9_700}
+        base.update(over)
+        return KeyUsage("main", "qwen3", **base)
+
+    def test_one_shot_has_a_single_in_out_column(self):
+        teams = [TeamOverview("acme-lab", "15m", [self.team()])]
+        with mock.patch.object(cli_module, "_fetch", return_value=canned_snapshot(teams=teams)):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                cli_module.main(["--team", "acme-lab", "--width", "120"])
+        header = next(line for line in out.getvalue().splitlines() if line.startswith("API KEY"))
+        assert "15m IN/OUT" in header, header
+        assert "IN/OUT now" not in header, header
+        assert header.count("IN/OUT") == 1, header
+
+    def test_watch_reserves_the_frame_columns_from_the_first_tick(self):
+        teams = [TeamOverview("acme-lab", "15m", [self.team()])]
+        frames = iter([canned_snapshot(teams=teams), KeyboardInterrupt()])
+
+        def fake_fetch(args, tracker=None):
+            value = next(frames)
+            if not isinstance(value, Snapshot):
+                raise value
+            return value
+
+        out = io.StringIO()
+        with mock.patch.object(cli_module, "_fetch", side_effect=fake_fetch), \
+             mock.patch.object(cli_module.time, "sleep"), contextlib.redirect_stdout(out):
+            cli_module.main(["--watch", "1", "--team", "acme-lab", "--width", "120"])
+        header = next(line for line in out.getvalue().splitlines() if line.startswith("API KEY"))
+        assert "IN/OUT -2" in header and "IN/OUT -1" in header and "IN/OUT now" in header, header
+
+    def test_history_flag_widens_the_strip(self):
+        teams = [TeamOverview("acme-lab", "15m", [self.team()])]
+        frames = iter([canned_snapshot(teams=teams), KeyboardInterrupt()])
+
+        def fake_fetch(args, tracker=None):
+            value = next(frames)
+            if not isinstance(value, Snapshot):
+                raise value
+            return value
+
+        out = io.StringIO()
+        with mock.patch.object(cli_module, "_fetch", side_effect=fake_fetch), \
+             mock.patch.object(cli_module.time, "sleep"), contextlib.redirect_stdout(out):
+            cli_module.main(["--watch", "1", "--history", "5", "--team", "acme-lab", "--width", "160"])
+        header = next(line for line in out.getvalue().splitlines() if line.startswith("API KEY"))
+        assert "IN/OUT -4" in header, header
+
+
 class TestWatchMode(unittest.TestCase):
     def frames(self, values):
         """A _fetch stand-in that replays snapshots and exceptions in order."""
         pending = iter(values)
 
-        def fake_fetch(args):
+        def fake_fetch(args, tracker=None):
             value = next(pending)
             if not isinstance(value, Snapshot):
                 raise value

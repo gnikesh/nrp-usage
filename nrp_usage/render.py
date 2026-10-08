@@ -10,12 +10,13 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 from .model import (
     DEFAULT_THRESHOLDS,
     AliasUsage,
+    KeyUsage,
     Level,
     ModelUsage,
     Snapshot,
@@ -24,6 +25,7 @@ from .model import (
     group_by_family,
     summarise,
 )
+from .trend import Interval, Trend, combine
 
 CODES = {
     "bold": "1",
@@ -127,6 +129,8 @@ class RenderOptions:
     sort_key: str = "load"
     window: str = "15m"
     max_keys: int = 8
+    history_slots: int = 3
+    history_reserved: bool = False  # watching: hold the strip's columns even before data exists
     width: int = 0
 
     def resolved_width(self) -> int:
@@ -213,6 +217,49 @@ def interleave_rows(
     return lines
 
 
+# "=" would read as an equation between two quantities, so steady flow gets an arrow too
+ARROWS = {Trend.UP: "↑", Trend.DOWN: "↓", Trend.FLAT: "→", Trend.UNKNOWN: ""}
+ASCII_ARROWS = {Trend.UP: "^", Trend.DOWN: "v", Trend.FLAT: ">", Trend.UNKNOWN: ""}
+TREND_STYLE = {Trend.UP: "green", Trend.DOWN: "red", Trend.FLAT: "grey", Trend.UNKNOWN: "grey"}
+
+
+def half_cell(item: Interval | None, theme: Theme, unicode: bool) -> str:
+    """One side of a pair: ``↑3.0K``. Blank when no interval has closed yet."""
+    if item is None:
+        return theme.paint("·", "dim")
+    arrow = (ARROWS if unicode else ASCII_ARROWS)[item.trend]
+    # the magnitude always rides along: a lone "↓" cannot say whether that is "a bit slower"
+    # or "produced nothing", and those want very different reactions
+    return theme.paint(f"{arrow}{format_tokens(item.tokens)}", TREND_STYLE[item.trend])
+
+
+def pair_cell(pair: tuple[Interval | None, Interval | None], theme: Theme, unicode: bool) -> str:
+    """One frame's reading, as ``IN/OUT`` with an arrow on each side."""
+    return f"{half_cell(pair[0], theme, unicode)}/{half_cell(pair[1], theme, unicode)}"
+
+
+def format_tokens(value: float | None) -> str:
+    """Compact token counts as K / M / B, one decimal place.
+
+    15 minutes of traffic runs to seven figures, so raw counts do not fit a column.
+    Below 1000 the exact count is shown, because "0.0K" tells you less than "812".
+    """
+    if value is None:
+        return "-"
+    number = float(value)
+    if number < 0:
+        return "-"
+    if number < 1000:
+        return f"{number:.0f}"
+    for threshold, unit in ((1e12, "T"), (1e9, "B"), (1e6, "M"), (1e3, "K")):
+        scaled = number / threshold
+        if scaled >= 0.9995:  # only a unit this value actually rounds into
+            if scaled >= 999.95:  # "1000.0M" is really "1.0B", so promote
+                continue
+            return f"{scaled:.1f}{unit}"
+    return f"{number:.0f}"
+
+
 def format_duration(seconds: float | None) -> str:
     if seconds is None:
         return "-"
@@ -280,6 +327,40 @@ class Column:
 KV_WIDTH = 14  # '████····  44%'
 
 
+def drop_to_fit(
+    columns: list[Column],
+    primary: str,
+    primary_floor: int,
+    width: int,
+    content_widths: Mapping[str, int] | None = None,
+) -> list[Column]:
+    """Remove optional columns, right-most first, until the table fits ``width``.
+
+    Runs before rendering so a header is never squeezed into elided mush: losing a whole
+    column is far easier to read than "RE…SON". ``content_widths`` gives the measured width
+    of columns sized from their data, so the estimate is not a guess that only fails later.
+    """
+    content = dict(content_widths or {})
+
+    def estimate(col: Column) -> int:
+        # planned before cells exist, so approximate what format_table will measure
+        if col.fixed is not None:
+            return col.fixed
+        if col.key == primary:
+            return primary_floor
+        return max(len(col.header), content.get(col.key, 6))
+
+    def natural(cols: list[Column]) -> int:
+        return sum(estimate(c) for c in cols) + len(GAP) * (len(cols) - 1)
+
+    while natural(columns) > width and any(c.optional for c in columns):
+        for candidate in reversed(columns):
+            if candidate.optional:
+                columns.remove(candidate)
+                break
+    return columns
+
+
 def plan_columns(rows: Sequence[RowSpec], opts: RenderOptions, width: int) -> list[Column]:
     columns = [
         Column("name", "MODEL", align="left"),
@@ -298,26 +379,15 @@ def plan_columns(rows: Sequence[RowSpec], opts: RenderOptions, width: int) -> li
     columns.append(Column("queue", "AVG WAIT", fixed=9, optional=True))
     columns.append(Column("status", "STATUS", align="left", fixed=12))
 
-    def estimate(col: Column) -> int:
-        # the planner runs before cells exist, so approximate what is measured later
-        return col.fixed if col.fixed is not None else len(col.header) + 1
-
-    def natural(cols: list[Column]) -> int:
+    def name_floor() -> int:
         # reserve the widest thing the name column will ever have to show
-        name_floor = max((len(row.display) for row in rows), default=10)
+        floor = max((len(row.display) for row in rows), default=10)
         if not opts.full_names:
-            name_floor = min(name_floor, 34)
-        name_floor = max(name_floor, len("MODEL"), 12)
-        gaps = GAP * (len(cols) - 1)
-        body = sum(estimate(c) for c in cols if c.key != "name")
-        return name_floor + body + len(gaps)
+            floor = min(floor, 34)
+        return max(floor, len("MODEL"), 12)
 
-    while natural(columns) > width and any(c.optional for c in columns):
-        for candidate in reversed(columns):
-            if candidate.optional:
-                columns.remove(candidate)
-                break
-    return columns
+    return drop_to_fit(columns, primary="name", primary_floor=name_floor(), width=width,
+                       content_widths={"status": 12})
 
 
 def cell_for(row: RowSpec, key: str, theme: Theme, opts: RenderOptions) -> str:
@@ -400,18 +470,18 @@ def format_table(
     if name_needed + others + gaps <= width:
         sizes[primary] = name_needed
     else:
-        # Model names elide gracefully ("Qwe…27B"); numbers and status words do not,
-        # so the name column absorbs pressure first (up to primary_floor).
+        # Shrink in the order that loses meaning last: names elide legibly
+        # ("deepseek-v4-fl…"), a truncated number does not ("124.1" from "124.1K").
         deficit = name_needed + others + gaps - width
         floor = min(name_needed, primary_floor)
         cut = min(deficit, name_needed - floor)
         sizes[primary] = name_needed - cut
         deficit -= cut
-        for col in reversed(columns):
+        named = [col for col in reversed(columns) if col.key != primary and col.align == "left"]
+        numeric = [col for col in reversed(columns) if col not in named and col.key != primary]
+        for col in named + numeric:
             if deficit <= 0:
                 break
-            if col.key == primary:
-                continue
             room = sizes[col.key] - 5
             if room <= 0:
                 continue
@@ -437,7 +507,9 @@ def format_table(
             text = row[index[col.key]]
             visible = strip_ansi(text)
             if len(visible) > size:
-                text = elide(visible, size, theme) if col.key == primary else visible[:size]
+                # left-aligned cells elide with a marker; silently chopping a name into
+                # "gemma-4-31B-i" leaves something that reads like a different real model
+                text = elide(visible, size, theme) if col.align == "left" else visible[:size]
             parts.append(pad(text, size, col.align))
         lines.append(GAP.join(parts).rstrip())
     return lines
@@ -462,11 +534,29 @@ def render_header(snapshot: Snapshot, models: Sequence[ModelUsage], theme: Theme
     queued = [m for m in models if m.queued]
     if queued:
         worst = max(queued, key=lambda m: m.waiting)
-        detail = (
-            f"busiest queue: {display_label(worst, opts)} ({worst.waiting} waiting, "
-            f"{format_duration(worst.queue_avg)} mean wait so far)"
+        # A queue that just formed has no completed requests to average yet, and "( -, mean wait)"
+        # reads like a broken number rather than an unknown one, so the clause is dropped.
+        timing = f", {format_duration(worst.queue_avg)} mean wait so far" if worst.queue_avg is not None else ""
+        lines.append(
+            theme.paint(
+                clamp(f"busiest queue: {display_label(worst, opts)} ({worst.waiting} waiting{timing})", width, theme),
+                "yellow",
+            )
         )
-        lines.append(theme.paint(clamp(detail, width, theme), "yellow"))
+    else:
+        # Always emitted, never conditionally: omitting it lifts the whole table a row whenever
+        # a queue drains and drops it back when one forms. The placeholder also confirms the
+        # absence is real rather than a missing line.
+        idle = [m for m in models if not m.queued and m.waiting_peak]
+        if idle:
+            quiet = max(idle, key=lambda m: m.waiting_peak)
+            detail = (
+                f"busiest queue: none now, up to {quiet.waiting_peak} in the last "
+                f"{snapshot.window} on {display_label(quiet, opts)}"
+            )
+        else:
+            detail = "busiest queue: none"
+        lines.append(theme.paint(clamp(detail, width, theme), "dim"))
     return lines
 
 
@@ -521,66 +611,190 @@ def render_gateway(aliases: Sequence[AliasUsage], theme: Theme, opts: RenderOpti
     return [header, *format_table(columns, rows, width=opts.resolved_width(), theme=theme, separator=True)]
 
 
-def render_team(team: TeamOverview, theme: Theme, opts: RenderOptions) -> list[str]:
-    """Which API keys of a team are hitting which models, and how long those calls take.
+# Fixed, not content-derived, so the table cannot reflow between --watch frames: sizing
+# these from the data shifts every column sideways whenever a delta appears or disappears.
+# 15 is the widest legitimate cell, e.g. "999.9M ↑999.9K".
+TOKEN_WIDTH = 15
 
-    Capped at ``opts.max_keys`` rows: this sits under the main table as a quick read.
-    The totals row and --json still cover every pair.
+
+PAIR_WIDTH = 14  # widest honest cell: two 5-char counts plus an arrow each, e.g. "↑99.9K/↑99.9K"
+
+
+def slot_item(key: KeyUsage, stream: str, position: int, total: int) -> Interval | None:
+    """The interval belonging to strip column ``position`` for one row and one stream.
+
+    Histories are aligned to their newest entry, so a row that appeared only recently still
+    puts its latest reading under the newest column instead of shifting it left.
     """
+    history = getattr(key, f"{stream}_history", None) or []
+    if not history:
+        return None
+    index = len(history) - total + position
+    return history[index] if 0 <= index < len(history) else None
+
+
+def fold_slot(keys: Sequence[KeyUsage], stream: str, position: int, total: int) -> Interval | None:
+    """Aggregate one strip column across several rows."""
+    parts = [item for key in keys if (item := slot_item(key, stream, position, total)) is not None]
+    return combine(*parts) if parts else None
+
+
+def render_team(team: TeamOverview, theme: Theme, opts: RenderOptions) -> list[str]:
+    """Which API keys of a team are hitting which models, and what each frame produced.
+
+    The strip is one ``IN/OUT`` column per recent frame, oldest on the left and the newest
+    reading on the right, each side arrowed against its own predecessor. Rows are capped at
+    ``opts.max_keys``; the totals line and --json still cover every pair.
+    """
+    slots_hint = max(1, opts.history_slots)
     title = theme.paint(f"team {team.team_id}", "bold")
     subtitle = theme.paint(team.summary(), "grey")
     if not team.keys:
-        return [title, subtitle]
+        # still three lines, so a team that starts or stops producing traffic does not lift the
+        # blocks below it by a row
+        return [
+            title,
+            subtitle,
+            theme.paint(f"run with --watch for a {slots_hint}-frame IN/OUT history strip", "dim"),
+        ]
 
     shown, hidden = team.keys[: opts.max_keys], team.keys[opts.max_keys :]
+    slots = slots_hint
+    # short enough that a narrow terminal cannot elide it into "2 key/… pairs"
+    total_label = f"{len(team.keys)} pair{'s' if len(team.keys) != 1 else ''}"
+    key_floor = max(12, len(total_label))
 
     def mean_cell(seconds: float | None) -> str:
         if seconds is None:
             return theme.paint("-", "dim")
         return theme.paint(format_duration(seconds), duration_style(seconds))
 
-    columns = [
+    def reason_cell(value: float) -> str:
+        return theme.paint(format_tokens(value), "grey") if value > 0 else theme.paint("-", "dim")
+
+    def window_cell(in_tokens: float, out_tokens: float, bold: bool = False) -> str:
+        if not in_tokens and not out_tokens:
+            return theme.paint("-/-", "dim")
+        text = f"{format_tokens(in_tokens)}/{format_tokens(out_tokens)}"
+        return theme.paint(text, "grey" if not bold else None)
+
+    want_reason = any(k.reasoning_tokens > 0 for k in team.keys)
+    # With no history at all (one-shot run) the strip would be pure placeholders, so it is
+    # omitted. While watching, the columns are reserved from the first frame so the table
+    # never changes shape mid-session as the cells fill in.
+    has_history = any(k.in_history or k.out_history for k in team.keys)
+    show_strip = has_history or opts.history_reserved
+    columns: list[Column] = [
         Column("key", "API KEY", align="left"),
         Column("model", "MODEL", align="left"),
-        Column("rpm", "REQ/MIN", fixed=8),
-        Column("mean", "MEAN SEC", fixed=9),
+        Column("rpm", "REQ/MIN", fixed=8, optional=True),
+        Column("mean", "MEAN SEC", fixed=9, optional=True),
     ]
+    if show_strip:
+        # oldest left, newest right; never dropped, since the strip is the point of the section.
+        # Age-labelled because three identical headers do not say which side is newest.
+        for index in range(slots):
+            age = index - (slots - 1)
+            header = "IN/OUT now" if age == 0 else f"IN/OUT {age}"
+            columns.append(Column(f"slot{index}", header, fixed=PAIR_WIDTH))
+    # only droppable once the strip is competing for width; otherwise it is the sole token view
+    columns.append(Column("window", f"{team.window} IN/OUT", fixed=PAIR_WIDTH, optional=show_strip))
+    if want_reason:
+        columns.append(Column("reason", "REASON", fixed=8, optional=True))
+    columns = drop_to_fit(
+        columns,
+        primary="key",
+        primary_floor=key_floor,
+        width=opts.resolved_width(),
+        content_widths={"model": max([len("MODEL")] + [len(k.model) for k in team.keys])},
+    )
+
+    def make_row(values: dict[str, str]) -> list[str]:
+        """Emit cells in surviving-column order; positional rows break when one is dropped."""
+        return [values.get(col.key, "") for col in columns]
+
+    def strip_cells(key: KeyUsage) -> dict[str, str]:
+        return {
+            f"slot{position}": pair_cell(
+                (slot_item(key, "in", position, slots), slot_item(key, "out", position, slots)),
+                theme,
+                theme.unicode,
+            )
+            for position in range(slots)
+        }
+
+    def strip_fold(keys: Sequence[KeyUsage]) -> dict[str, str]:
+        return {
+            f"slot{position}": pair_cell(
+                (fold_slot(keys, "in", position, slots), fold_slot(keys, "out", position, slots)),
+                theme,
+                theme.unicode,
+            )
+            for position in range(slots)
+        }
+
     rows = [
-        [
-            theme.paint(key.token_alias, "cyan"),
-            theme.paint(key.model, "blue"),
-            theme.paint(f"{key.req_per_min:.1f}", "bold"),
-            mean_cell(key.mean_seconds),
-        ]
+        make_row(
+            {
+                "key": theme.paint(key.token_alias, "cyan"),
+                "model": theme.paint(key.model, "blue"),
+                "rpm": theme.paint(f"{key.req_per_min:.1f}", "bold"),
+                "mean": mean_cell(key.mean_seconds),
+                "window": window_cell(key.in_tokens, key.out_tokens),
+                "reason": reason_cell(key.reasoning_tokens),
+                **strip_cells(key),
+            }
+        )
         for key in shown
     ]
     if hidden:
         rows.append(
-            [
-                theme.paint(f"... {len(hidden)} more pair{'s' if len(hidden) != 1 else ''}", "grey"),
-                "",
-                theme.paint(f"{sum(k.req_per_min for k in hidden):.1f}", "grey"),
-                theme.paint("-", "dim"),
-            ]
+            make_row(
+                {
+                    "key": theme.paint(f"... +{len(hidden)}", "grey"),
+                    "rpm": theme.paint(f"{sum(k.req_per_min for k in hidden):.1f}", "grey"),
+                    "mean": theme.paint("-", "dim"),
+                    "window": window_cell(
+                        sum(k.in_tokens for k in hidden), sum(k.out_tokens for k in hidden)
+                    ),
+                    "reason": reason_cell(sum(k.reasoning_tokens for k in hidden)),
+                    **strip_fold(hidden),
+                }
+            )
         )
-    total = [
-        theme.paint(f"{len(team.keys)} key/model pair{'s' if len(team.keys) != 1 else ''}", "bold"),
-        "",
-        theme.paint(f"{team.req_per_min:.1f}", "bold"),
-        theme.paint("-", "dim"),  # no weighted mean available across keys
-    ]
-    return [
-        title,
-        subtitle,
-        *format_table(
-            columns,
-            [*rows, total],
-            width=opts.resolved_width(),
-            theme=theme,
-            primary="key",
-            separator=True,
-        ),
-    ]
+    rows.append(
+        make_row(
+            {
+                "key": theme.paint(total_label, "bold"),
+                "rpm": theme.paint(f"{team.req_per_min:.1f}", "bold"),
+                "mean": theme.paint("-", "dim"),  # no weighted mean available across keys
+                "window": window_cell(team.in_tokens, team.out_tokens, bold=True),
+                "reason": reason_cell(team.reasoning_tokens),
+                **strip_fold(team.keys),
+            }
+        )
+    )
+
+    clauses = []
+    if show_strip:
+        clauses.append(f"the {slots} IN/OUT columns are the last {slots} frames, oldest left / newest right")
+        clauses.append("arrows compare each frame's rate with the one before")
+    else:
+        clauses.append(f"run with --watch for a {slots}-frame IN/OUT history strip")
+    clauses.append(f"{team.window} IN/OUT covers the whole window; REASON is part of its OUT")
+    while len(clauses) > 1 and len(" · ".join(clauses)) > opts.resolved_width():
+        clauses.pop()
+    lines = [title, subtitle, theme.paint(" · ".join(clauses), "dim")]
+    lines += format_table(
+        columns,
+        rows,
+        width=opts.resolved_width(),
+        theme=theme,
+        primary="key",
+        primary_floor=key_floor,
+        separator=True,
+    )
+    return lines
 
 
 def render_report(

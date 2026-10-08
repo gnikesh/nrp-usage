@@ -8,6 +8,7 @@ the gateway metrics that show which API keys of a team are driving the traffic.
 from __future__ import annotations
 
 import re
+import time
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 
@@ -25,6 +26,7 @@ from .model import (
     compile_pattern,
 )
 from .prometheus import PromClient, QueryError, Sample
+from .trend import Interval, RowPair, SamplePair, TrendTracker
 
 MODEL_LABEL = "model_name"
 ALIAS_LABEL = "gen_ai_original_model"
@@ -130,6 +132,13 @@ def prom_matcher(label: str, values: Sequence[str]) -> str:
     return f'{label}=~"{prom_string_literal(regex_matcher(values))}"'
 
 
+#: per-team token breakdown, mapped to the result suffix each one feeds
+TEAM_TOKEN_TYPES = {"tin": "input", "tout": "output", "treason": "reasoning"}
+
+#: raw cumulative counter, differenced between --watch frames to get true production
+TEAM_COUNTER_ALL = "team_cum[{}]"
+
+
 def build_queries(
     *,
     window: str = "15m",
@@ -154,6 +163,15 @@ def build_queries(
         total = f"{by_pair} (rate({GATEWAY_DURATION_SUM}{{{sel}}}[{window}]))"
         queries[f"team_rpm[{team}]"] = f"{count} * 60"
         queries[f"team_mean[{team}]"] = f"{total} / {count}"
+        for suffix, token_type in TEAM_TOKEN_TYPES.items():
+            matchers = f'gen_ai_token_type="{token_type}",{sel}'
+            queries[f"team_{suffix}[{team}]"] = (
+                f"{by_pair} (increase({GATEWAY_TOKEN_USAGE}{{{matchers}}}[{window}]))"
+            )
+        # one query carrying all three types as cumulative counters, for frame deltas
+        queries[TEAM_COUNTER_ALL.format(team)] = (
+            f"sum by ({TEAM_PAIR}, gen_ai_token_type) ({GATEWAY_TOKEN_USAGE}{{{sel}}})"
+        )
     if gateway:
         extra = []
         if team_ids:
@@ -190,8 +208,12 @@ def _results_to_maps(
             kind, _, team = key.partition("[")
             team = team.rstrip("]")
             slot = teams.setdefault(team, {})
-            pair = "rpm" if kind.endswith("_rpm") else "mean"
-            slot[pair] = by_pair(value, "token_alias", "gen_ai_original_model")
+            if kind == "team_cum":
+                slot["cum"] = by_pair(
+                    value, "token_alias", "gen_ai_original_model", "gen_ai_token_type"
+                )
+            else:
+                slot[kind.removeprefix("team_")] = by_pair(value, "token_alias", "gen_ai_original_model")
         elif key == "waiting_reason":
             engine["waiting_by_reason"] = by_model_and_label(value, "reason")
         elif key.startswith("alias_"):
@@ -252,6 +274,9 @@ def make_snapshot(
                 slot.get("mean", {}),
                 window,
                 min_req_per_min=MIN_REQ_PER_MIN,
+                in_tokens=slot.get("tin", {}),
+                out_tokens=slot.get("tout", {}),
+                reasoning_tokens=slot.get("treason", {}),
             )
         )
     teams.sort(key=lambda t: t.team_id.casefold())
@@ -267,6 +292,39 @@ def make_snapshot(
     )
 
 
+def collect_counters(team_maps: Mapping[str, Mapping[str, Mapping]]) -> dict[SamplePair, float]:
+    """Flatten every team's cumulative counters into tracker-ready samples.
+
+    ``increase()`` over a window answers "how much in the last 15m", which is dominated by
+    which samples fell off the left edge; two frames 5s apart can differ on an idle model.
+    Production *right now* has to come from the raw counter, so it is sampled separately.
+    """
+    samples: dict[SamplePair, float] = {}
+    for team, slot in team_maps.items():
+        for (alias, model, token_type), value in slot.get("cum", {}).items():
+            samples[(team, alias, model, token_type)] = value
+    return samples
+
+
+def attach_trends(
+    snapshot: Snapshot,
+    histories: Mapping[str, Mapping[RowPair, list[Interval]]],
+    slots: int,
+) -> None:
+    """Copy the rolling per-interval production onto the matching key/model rows.
+
+    ``histories`` maps team id to {token_type: {row: intervals}}. Each row keeps the last
+    ``slots`` intervals oldest-first, which is what the team table renders as its strip.
+    """
+    for team in snapshot.teams:
+        per_type = histories.get(team.team_id, {})
+        ins, outs = per_type.get("input", {}), per_type.get("output", {})
+        for key in team.keys:
+            row = (team.team_id, key.token_alias, key.model)
+            key.in_history = list(ins.get(row, []))[-slots:]
+            key.out_history = list(outs.get(row, []))[-slots:]
+
+
 def fetch_snapshot(
     client: PromClient,
     *,
@@ -278,8 +336,14 @@ def fetch_snapshot(
     detail: str = "",
     contention: bool = True,
     overview_teams: Sequence[str] = (),
+    tracker: TrendTracker | None = None,
+    history_slots: int = 3,
 ) -> Snapshot:
-    """Run every query for one report and build the snapshot."""
+    """Run every query for one report and build the snapshot.
+
+    Pass a ``tracker`` (one instance reused across frames) to get rolling per-interval token
+    production on ``snapshot.teams``; without it the counts are shown but never arrowed.
+    """
     queries = build_queries(
         window=window,
         gateway=gateway,
@@ -288,8 +352,23 @@ def fetch_snapshot(
         contention=contention,
         overview_teams=overview_teams,
     )
+    # stamp before querying: the footer time and the trend clock must describe the
+    # samples actually read, not when assembly finished
+    fetched_at = datetime.now(timezone.utc)
+    stamp = time.monotonic()
     results = client.query_many(queries)
-    return make_snapshot(results, source=source, window=window, detail=detail)
+    snapshot = make_snapshot(
+        results, source=source, window=window, detail=detail, fetched_at=fetched_at
+    )
+    if tracker is not None and overview_teams:
+        _, _, _, team_maps = _results_to_maps(results)
+        tracker.observe(collect_counters(team_maps), stamp)
+        histories = {
+            team: {kind: tracker.intervals(history_slots, kind) for kind in ("input", "output")}
+            for team in overview_teams
+        }
+        attach_trends(snapshot, histories, history_slots)
+    return snapshot
 
 
 def team_traffic_query(window: str) -> str:

@@ -15,6 +15,7 @@ from .model import SORT_KEYS, Snapshot, Thresholds, filter_models, sort_models
 from .prometheus import AuthError, PromError
 from .render import RenderOptions, Theme, render_quiet, render_report
 from .source import DATASOURCE_UID, GRAFANA_URL, SourceError, resolve_source, token_from_file
+from .trend import TrendTracker
 from .usage import describe_queries, fetch_snapshot, list_teams
 
 EPILOG = f"""\
@@ -88,6 +89,9 @@ def build_parser() -> argparse.ArgumentParser:
                            "(positional PATTERNs filter the list)")
     data.add_argument("--keys", type=int, default=8, metavar="N", dest="max_keys",
                       help="rows of API keys to list per team in the overview (default: 8)")
+    data.add_argument("--history", type=int, default=3, metavar="N", dest="history_slots",
+                      help="IN/OUT columns per team row, one per --watch frame, oldest on the "
+                           "left and newest on the right (default: 3)")
     data.add_argument("--team", action="append", default=[], metavar="TEAM_ID",
                       help="add a per-team API-key overview below the table, and scope --gateway "
                            "figures to it (repeatable; falls back to $NRP_TEAMS, and to nothing if "
@@ -140,7 +144,7 @@ def _read_token(args: argparse.Namespace) -> str | None:
     return token_from_file(path) if path else None
 
 
-def _fetch(args: argparse.Namespace) -> Snapshot:
+def _fetch(args: argparse.Namespace, tracker: TrendTracker | None = None) -> Snapshot:
     source = resolve_source(
         prom_url=args.prom_url,
         grafana_url=args.grafana_url,
@@ -163,6 +167,8 @@ def _fetch(args: argparse.Namespace) -> Snapshot:
         token_aliases=args.token,
         contention=args.contention,
         overview_teams=_teams_of_interest(args),
+        tracker=tracker,
+        history_slots=max(1, args.history_slots),
     )
 
 
@@ -209,17 +215,22 @@ def _run_watch(args: argparse.Namespace, theme: Theme, opts: RenderOptions) -> i
     interval = float(args.watch)
     tty = sys.stdout.isatty()
     first = True
+    tracker = TrendTracker(depth=max(1, args.history_slots) + 2)
+    # +2 frames: n columns need n intervals, and an interval needs two frames, so the leftmost
+    # column still has a predecessor to compare against
     while True:
         started = time.monotonic()
         try:
-            snapshot = _fetch(args)
+            snapshot = _fetch(args, tracker)
             failure = _total_failure(snapshot)
             if failure:
+                tracker.reset()  # nothing useful was sampled; do not stretch the baseline
                 frame = theme.paint(f"nrp-usage: {failure}", "red")
             else:
                 frame = _frame(snapshot, _select(snapshot, args), args, theme, opts)
         except (PromError, SourceError) as exc:
             # Keep the display alive: a blip should not end a watch session.
+            tracker.reset()  # the gap is unknown, so the next frame restarts the baseline
             frame = theme.paint(f"nrp-usage: {exc}", "red")
         if tty and not first:
             sys.stdout.write("\x1b[H\x1b[2J")
@@ -303,6 +314,8 @@ def main(argv: list[str] | None = None) -> int:
         sort_key=args.sort,
         window=args.window,
         max_keys=max(1, args.max_keys),
+        history_slots=max(1, args.history_slots),
+        history_reserved=bool(args.watch),
         width=args.width,
     )
 

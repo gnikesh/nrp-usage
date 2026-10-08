@@ -309,7 +309,7 @@ class TestTeamOverview(unittest.TestCase):
         )
         self.assertEqual(
             [(k.token_alias, k.model) for k in team.keys][:2],
-            [("alpha-key", "qwen3"), ("alpha-key", "glm-5")],
+            [("alpha-key", "glm-5"), ("alpha-key", "qwen3")],   # alphabetical, not traffic order
         )
         self.assertAlmostEqual(team.req_per_min, 16.0)
         self.assertEqual((team.token_aliases, team.models), (2, 2))
@@ -333,13 +333,17 @@ class TestTeamOverview(unittest.TestCase):
         self.assertEqual(team.summary(), "no traffic in the last 15m")
         self.assertEqual(team.keys, [])
 
-    def test_sorted_by_traffic(self):
+    def test_rows_are_ordered_stably_not_by_who_is_busiest(self):
+        # this ledger is read across --watch frames; rows swapping each frame are unreadable
         team = build_team_overview(
             "t",
-            {("small", "m"): 1.0, ("big", "m"): 50.0, ("mid", "m"): 10.0},
+            {("zeta", "m"): 999.0, ("alpha", "z-model"): 5.0, ("alpha", "a-model"): 0.1},
             {},
         )
-        self.assertEqual([k.token_alias for k in team.keys], ["big", "mid", "small"])
+        self.assertEqual(
+            [(k.token_alias, k.model) for k in team.keys],
+            [("alpha", "a-model"), ("alpha", "z-model"), ("zeta", "m")],
+        )
 
     def test_singular_wording(self):
         team = build_team_overview("t", {("only", "qwen3"): 2.0}, {("only", "qwen3"): 1.0})
